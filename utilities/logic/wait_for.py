@@ -78,6 +78,11 @@ options:
     description:
       - port number to poll
     required: false
+  protocol:
+    description:
+      - protocol of port to connect to
+      - UDP tests depends upon the ability to receive an error response from the server when attempting to send to an inactive port.  Most hosts will reply with a "connection refused" error, but security software and hardware might prevent this response and will yield a false positive.
+    default: "tcp"
   state:
     description:
       - either C(present), C(started), or C(stopped), C(absent), or C(drained)
@@ -135,6 +140,9 @@ EXAMPLES = '''
 # wait 300 seconds for port 22 to become open and contain "OpenSSH", don't assume the inventory_hostname is resolvable
 # and don't start checking for 10 seconds
 - local_action: wait_for port=22 host="{{ ansible_ssh_host | default(inventory_hostname) }}" search_regex=OpenSSH delay=10
+
+# wait 300 seconds for UDP port 5060 to appear to be open
+- wait_for: proto=udp port=5060
 
 '''
 
@@ -326,23 +334,26 @@ def _convert_host_to_hex(host):
             ips.append((family, hexip_hf))
     return ips
 
-def _create_connection(host, port, connect_timeout):
+def _create_connection(host, port, proto, connect_timeout):
     """
     Connect to a 2-tuple (host, port) and return
     the socket object.
 
     Args:
-        2-tuple (host, port) and connection timeout
+        2-tuple (host, port), protocol, and connection timeout
     Returns:
         Socket object
     """
-    if sys.version_info < (2, 6):
-        (family, _) = _convert_host_to_ip(host)
-        connect_socket = socket.socket(family, socket.SOCK_STREAM)
-        connect_socket.settimeout(connect_timeout)
-        connect_socket.connect( (host, port) )
-    else:
-        connect_socket = socket.create_connection( (host, port), connect_timeout)
+
+    (family, _) = _convert_host_to_ip(host)
+    # Default is TCP
+    socktype = socket.SOCK_STREAM
+    if proto == 'udp':
+        socktype = socket.SOCK_DGRAM
+
+    connect_socket = socket.socket(family, socktype, socket.getprotobyname(proto))
+    connect_socket.settimeout(connect_timeout)
+    connect_socket.connect( (host, port) )
     return connect_socket
 
 def _timedelta_total_seconds(timedelta):
@@ -359,6 +370,7 @@ def main():
             connect_timeout=dict(default=5, type='int'),
             delay=dict(default=0, type='int'),
             port=dict(default=None, type='int'),
+            protocol=dict(default='tcp', choices=['tcp', 'udp'], aliases=['proto']),
             path=dict(default=None, type='path'),
             search_regex=dict(default=None),
             state=dict(default='started', choices=['started', 'stopped', 'present', 'absent', 'drained']),
@@ -413,7 +425,15 @@ def main():
                     break
             elif port:
                 try:
-                    s = _create_connection(host, port, connect_timeout)
+                    s = _create_connection(host, port, proto, connect_timeout)
+                    if proto == 'udp':
+                        # Attempt to send to and read from socket
+                        s.send("")
+                        (readable, w, e) = select.select([s], [], [], max_timeout)
+                        if readable:
+                            # There is a response waiting, but likely a "connection refused" error
+                            response = s.recv(1024)
+                            # If this doesn't raise an error the port might be up, so continue on
                     s.shutdown(socket.SHUT_RDWR)
                     s.close()
                     time.sleep(1)
@@ -424,7 +444,7 @@ def main():
         else:
             elapsed = datetime.datetime.now() - start
             if port:
-                module.fail_json(msg="Timeout when waiting for %s:%s to stop." % (host, port), elapsed=elapsed.seconds)
+                module.fail_json(msg="Timeout when waiting for %s:%s (%s) to stop." % (host, port, proto), elapsed=elapsed.seconds)
             elif path:
                 module.fail_json(msg="Timeout when waiting for %s to be absent." % (path), elapsed=elapsed.seconds)
 
@@ -459,7 +479,19 @@ def main():
             elif port:
                 alt_connect_timeout = math.ceil(_timedelta_total_seconds(end - datetime.datetime.now()))
                 try:
-                    s = _create_connection(host, port, min(connect_timeout, alt_connect_timeout))
+                    s = _create_connection(host, port, proto, min(connect_timeout, alt_connect_timeout))
+                    if proto == 'udp':
+                        s.send("")
+                        max_timeout = math.ceil(_timedelta_total_seconds(end - datetime.datetime.now()))
+                        (readable, w, e) = select.select([s], [], [], max_timeout)
+                        if readable:
+                            response = s.recv(1024)
+                            # If this connection didn't raise an error it might be up.  In case we need to look for data
+                            # on the socket we will create a clean one for that logic below.
+                            s.shutdown(socket.SHUT_RDWR)
+                            s.close()
+                            s = _create_connection((host, port), proto, min(connect_timeout, alt_connect_timeout))
+                            s.send("")
                 except:
                     # Failed to connect by connect_timeout. wait and try again
                     pass
@@ -529,7 +561,7 @@ def main():
             module.fail_json(msg="Timeout when waiting for %s:%s to drain" % (host, port), elapsed=elapsed.seconds)
 
     elapsed = datetime.datetime.now() - start
-    module.exit_json(state=state, port=port, search_regex=search_regex, path=path, elapsed=elapsed.seconds)
+    module.exit_json(state=state, port=port, proto=proto, search_regex=search_regex, path=path, elapsed=elapsed.seconds)
 
 # import module snippets
 from ansible.module_utils.basic import *
